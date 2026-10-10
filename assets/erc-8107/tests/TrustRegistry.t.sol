@@ -990,6 +990,177 @@ contract TrustRegistryTest is Test {
     }
 
     // ───────────────────────────────────────────────────────────────────────────
+    // verifyPath - validator distrust
+    // The validator's effective None for any later node voids the path, through
+    // verifyPath and both gate hooks alike
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /// @dev Asserts one verdict from verifyPath and both gate hooks. The gate is keyed
+    ///      to the path's first node and the terminal node is bound to an address, so
+    ///      every gate-specific check passes and only path verification decides.
+    function _assertVerdicts(bytes32[] memory nodes, ValidationParams memory p, bool expected, string memory why)
+        internal
+    {
+        bytes32 target = nodes[nodes.length - 1];
+        address targetAddr = address(uint160(uint256(target)));
+        _bindAddr(target, targetAddr);
+        vm.prank(coordinator);
+        registry.setIdentityGate(MEV_COORDINATION, nodes[0], p);
+
+        TrustPath memory path = _path(nodes);
+        assertEq(registry.verifyPath(path, p), expected, string.concat("verifyPath: ", why));
+        assertEq(
+            registry.validateParticipantWithPath(coordinator, MEV_COORDINATION, target, path),
+            expected,
+            string.concat("validateParticipantWithPath: ", why)
+        );
+        assertEq(
+            registry.validateParticipantAddress(coordinator, MEV_COORDINATION, targetAddr, path),
+            expected,
+            string.concat("validateParticipantAddress: ", why)
+        );
+    }
+
+    function _defiParams() internal pure returns (ValidationParams memory) {
+        return _params(5, TrustLevel.Marginal, DEFI, true, new bytes32[](0));
+    }
+
+    /// @dev Core regression. ALICE revoked CAROL, so an endorsement from BOB must not
+    ///      route CAROL back into ALICE's trust decision
+    function test_ValidatorDistrust_TargetRejectedDespiteIndirectPath() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), _defaultParams(), true, "indirect path valid before revocation");
+
+        vm.prank(alice);
+        registry.revokeTrust(ALICE, CAROL, UNIVERSAL, keccak256("COMPROMISED"));
+
+        _assertVerdicts(_nodes2(ALICE, CAROL), _defaultParams(), false, "direct edge is None");
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), _defaultParams(), false, "indirect path to a distrusted target");
+    }
+
+    /// @dev Distrusting an agent rejects its judgement, so a path cannot pass through it
+    function test_ValidatorDistrust_IntermediaryRejected() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(carolKey, CAROL, DAVE, TrustLevel.Full, UNIVERSAL, 1);
+        _assertVerdicts(_nodes4(ALICE, BOB, CAROL, DAVE), _defaultParams(), true, "valid before revocation");
+
+        vm.prank(alice);
+        registry.revokeTrust(ALICE, CAROL, UNIVERSAL, keccak256("MISBEHAVIOR"));
+
+        _assertVerdicts(_nodes4(ALICE, BOB, CAROL, DAVE), _defaultParams(), false, "path through a distrusted agent");
+    }
+
+    /// @dev Only the validator's distrust vetoes. Distrust held by a node off the path,
+    ///      or by a non-validator node on it towards a non-adjacent node, does not
+    function test_ValidatorDistrust_OtherNodesDistrustDoesNotVeto() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(carolKey, CAROL, DAVE, TrustLevel.Full, UNIVERSAL, 1);
+
+        vm.prank(dave);
+        registry.revokeTrust(DAVE, CAROL, UNIVERSAL, keccak256("MISBEHAVIOR"));
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), _defaultParams(), true, "off-path distrust does not veto");
+
+        vm.prank(bob);
+        registry.revokeTrust(BOB, DAVE, UNIVERSAL, keccak256("MISBEHAVIOR"));
+        _assertVerdicts(
+            _nodes4(ALICE, BOB, CAROL, DAVE), _defaultParams(), true, "non-validator distrust does not veto"
+        );
+
+        // The per-edge check still applies to every node
+        vm.prank(carol);
+        registry.revokeTrust(CAROL, DAVE, UNIVERSAL, keccak256("MISBEHAVIOR"));
+        _assertVerdicts(_nodes4(ALICE, BOB, CAROL, DAVE), _defaultParams(), false, "a None edge still voids");
+    }
+
+    /// @dev Universal None applies in every scope, including over a scoped grant
+    function test_ValidatorDistrust_UniversalNoneAppliesInNamedScope() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(aliceKey, ALICE, CAROL, TrustLevel.Full, DEFI, 2);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+
+        vm.prank(alice);
+        registry.revokeTrust(ALICE, CAROL, UNIVERSAL, keccak256("COMPROMISED"));
+
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), _defiParams(), false, "universal None in a named scope");
+    }
+
+    function test_ValidatorDistrust_ScopedNoneAppliesInThatScope() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+
+        vm.prank(alice);
+        registry.revokeTrust(ALICE, CAROL, DEFI, keccak256("MISBEHAVIOR"));
+
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), _defiParams(), false, "scoped None in its own scope");
+    }
+
+    function test_ValidatorDistrust_ScopedNoneDoesNotApplyInOtherScope() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+
+        vm.prank(alice);
+        registry.revokeTrust(ALICE, CAROL, DEFI, keccak256("MISBEHAVIOR"));
+
+        ValidationParams memory gaming = _params(5, TrustLevel.Marginal, GAMING, true, new bytes32[](0));
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), gaming, true, "scoped None in another scope");
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), _defaultParams(), true, "scoped None at universal scope");
+    }
+
+    /// @dev Unknown is not None: the validator need hold no record for later nodes
+    function test_ValidatorDistrust_UnknownDoesNotVeto() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Marginal, UNIVERSAL, 1);
+        _grant(carolKey, CAROL, DAVE, TrustLevel.Full, UNIVERSAL, 1);
+
+        (TrustLevel toCarol,) = registry.getTrust(ALICE, CAROL, UNIVERSAL);
+        (TrustLevel toDave,) = registry.getTrust(ALICE, DAVE, UNIVERSAL);
+        assertEq(uint8(toCarol), uint8(TrustLevel.Unknown));
+        assertEq(uint8(toDave), uint8(TrustLevel.Unknown));
+
+        _assertVerdicts(_nodes4(ALICE, BOB, CAROL, DAVE), _defaultParams(), true, "no validator record");
+        _assertVerdicts(_nodes4(ALICE, BOB, CAROL, DAVE), _defiParams(), true, "no validator record, named scope");
+    }
+
+    /// @dev Revocation is not permanent: a later attestation lifts the exclusion
+    function test_ValidatorDistrust_LiftedByLaterAttestation() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+
+        vm.prank(alice);
+        registry.revokeTrust(ALICE, CAROL, UNIVERSAL, keccak256("MISBEHAVIOR"));
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), _defaultParams(), false, "excluded after revocation");
+
+        _grant(aliceKey, ALICE, CAROL, TrustLevel.Marginal, UNIVERSAL, 2);
+        _assertVerdicts(_nodes3(ALICE, BOB, CAROL), _defaultParams(), true, "restored by a later attestation");
+    }
+
+    /// @dev On a two-node path the validator check adds nothing to the edge check
+    function test_ValidatorDistrust_TwoNodePathUnchanged() public {
+        _grant(aliceKey, ALICE, BOB, TrustLevel.Full, UNIVERSAL, 1);
+
+        vm.prank(carol);
+        registry.revokeTrust(CAROL, BOB, UNIVERSAL, keccak256("MISBEHAVIOR"));
+        _assertVerdicts(_nodes2(ALICE, BOB), _defaultParams(), true, "third-party distrust ignored");
+
+        vm.prank(alice);
+        registry.revokeTrust(ALICE, BOB, UNIVERSAL, keccak256("MISBEHAVIOR"));
+        _assertVerdicts(_nodes2(ALICE, BOB), _defaultParams(), false, "the edge itself is None");
+    }
+
+    /// @dev Regression guard: a direct attestation from the gatekeeper cannot satisfy a
+    ///      gate that requires an anchor, so whoever controls the gatekeeper name cannot
+    ///      admit agents to such a gate directly
+    function test_AnchoredGate_RejectsDirectPath() public {
+        _grant(aliceKey, ALICE, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+
+        _assertVerdicts(_nodes2(ALICE, CAROL), _defaultParams(), true, "unanchored gate admits a direct path");
+        _assertVerdicts(_nodes2(ALICE, CAROL), _anchored(), false, "anchored gate rejects a direct path");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
     // Identity gates
     // ───────────────────────────────────────────────────────────────────────────
 

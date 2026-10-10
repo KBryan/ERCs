@@ -179,8 +179,9 @@ interface ITrustRegistry is IERC165 {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// @notice Verify a pre-computed trust path
-    /// @dev Returns true only if every edge check AND the requiredAnchors
-    ///      constraint are satisfied. There is no partial success.
+    /// @dev Returns true only if every edge check, the validator distrust check
+    ///      AND the requiredAnchors constraint are satisfied. There is no partial
+    ///      success.
     /// @param path The trust path to verify
     /// @param params Validation parameters
     /// @return valid Whether the path satisfies all validation requirements

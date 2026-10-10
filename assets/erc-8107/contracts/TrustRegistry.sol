@@ -258,6 +258,9 @@ contract TrustRegistry is ITrustRegistry, EIP712 {
     }
 
     /// @dev Core path verification. Cost is O(path length x requiredAnchors).
+    ///      Besides the per-edge checks, the validator's effective trust in every
+    ///      later node must not be None: its direct distrust overrides any indirect
+    ///      endorsement within its own trust decision.
     ///      `validateParams` is false only for parameters read from a stored gate,
     ///      which `setIdentityGate` validated when it stored them.
     function _verifyPath(TrustPath memory path, ValidationParams memory params, bool validateParams)
@@ -281,6 +284,14 @@ contract TrustRegistry is ITrustRegistry, EIP712 {
             for (uint256 j = i + 1; j < path.nodes.length; j++) {
                 if (path.nodes[i] == path.nodes[j]) return false;
             }
+        }
+
+        // The validator's direct distrust overrides any indirect endorsement.
+        // k = 1 is already covered by the first edge check.
+        bytes32 validator = path.nodes[0];
+        for (uint256 k = 2; k < path.nodes.length; ++k) {
+            (TrustLevel level,) = _edgeTrust(validator, path.nodes[k], params.scope);
+            if (level == TrustLevel.None) return false;
         }
 
         // Track anchor satisfaction
