@@ -165,6 +165,10 @@ contract Delegate7702ERC1271 is IERC1271 {
     }
 }
 
+/// @notice Stands in for the ENSv2 Graveyard: holds migrated ENSv1 names and does not
+///         implement isValidSignature
+contract MockGraveyard {}
+
 contract TrustRegistryTest is Test {
     TrustRegistry internal registry;
     MockENS internal ens;
@@ -1929,6 +1933,117 @@ contract TrustRegistryTest is Test {
         vm.expectRevert(abi.encodeWithSelector(GateNotFound.selector, MEV_COORDINATION));
         registry.validateParticipantAddress(
             otherCoordinator, MEV_COORDINATION, carol, _path(_nodes3(ALICE, BOB, CAROL))
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // ENSv2 migration (see Backwards Compatibility, "ENSv2 Compatibility and
+    // Migration"). Modelled with a Graveyard stand-in; no ENSv2 contracts involved.
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /// @dev Moves `node` to a Graveyard stand-in, as the ENSv2 migration does. An
+    ///      unwrapped name moves in the registry; a wrapped name moves in the NameWrapper.
+    function _migrate(bytes32 node, bool wrapped) internal {
+        address graveyard = address(new MockGraveyard());
+        if (wrapped) wrapper.setWrappedOwner(node, graveyard);
+        else ens.setOwner(node, graveyard);
+    }
+
+    /// @dev ALICE as an unwrapped name, or WRAPPED held by alice in the NameWrapper
+    function _migrationSubject(bool wrapped) internal returns (bytes32 node) {
+        if (!wrapped) return ALICE;
+        _wrapName(WRAPPED, alice);
+        return WRAPPED;
+    }
+
+    function _assertMigratedCannotAttest(bool wrapped) internal {
+        bytes32 node = _migrationSubject(wrapped);
+        TrustAttestation memory preSigned = _att(node, BOB, TrustLevel.Full, UNIVERSAL, 0, 1);
+        bytes memory preSig = _sign(aliceKey, preSigned);
+
+        _migrate(node, wrapped);
+
+        vm.expectRevert(InvalidSignature.selector);
+        registry.setTrust(preSigned, preSig);
+
+        TrustAttestation memory fresh = _att(node, CAROL, TrustLevel.Full, UNIVERSAL, 0, 1);
+        bytes memory freshSig = _sign(aliceKey, fresh);
+        vm.expectRevert(InvalidSignature.selector);
+        registry.setTrust(fresh, freshSig);
+    }
+
+    function test_Migrated_UnwrappedCannotAttest() public {
+        _assertMigratedCannotAttest(false);
+    }
+
+    function test_Migrated_WrappedCannotAttest() public {
+        _assertMigratedCannotAttest(true);
+    }
+
+    function _assertMigratedCannotManage(bool wrapped) internal {
+        bytes32 node = _migrationSubject(wrapped);
+        _grant(aliceKey, node, BOB, TrustLevel.Full, UNIVERSAL, 1);
+
+        vm.prank(alice);
+        if (wrapped) wrapper.setApprovalForAll(mallory, true);
+        else ens.setApprovalForAll(mallory, true);
+
+        // Before migration the operator may revoke
+        vm.prank(mallory);
+        registry.revokeTrust(node, DAVE, UNIVERSAL, bytes32(0));
+
+        _migrate(node, wrapped);
+
+        address[2] memory former = [alice, mallory];
+        for (uint256 i = 0; i < 2; i++) {
+            vm.prank(former[i]);
+            vm.expectRevert(abi.encodeWithSelector(NotAuthorized.selector, node, former[i]));
+            registry.revokeTrust(node, BOB, UNIVERSAL, bytes32(0));
+
+            vm.prank(former[i]);
+            vm.expectRevert(abi.encodeWithSelector(NotAuthorized.selector, node, former[i]));
+            registry.invalidateNonces(node, 2);
+        }
+
+        (TrustLevel level,) = registry.getTrust(node, BOB, UNIVERSAL);
+        assertEq(uint8(level), uint8(TrustLevel.Full), "issued trust persists and cannot be withdrawn");
+    }
+
+    function test_Migrated_UnwrappedCannotRevokeOrInvalidate() public {
+        _assertMigratedCannotManage(false);
+    }
+
+    function test_Migrated_WrappedCannotRevokeOrInvalidate() public {
+        _assertMigratedCannotManage(true);
+    }
+
+    /// @dev Path verification reads stored relationships only, so it does not need
+    ///      each node to keep an ENSv1 controller
+    function test_Migrated_StoredPathsStillVerify() public {
+        _wrapName(WRAPPED, alice);
+        _grant(aliceKey, WRAPPED, BOB, TrustLevel.Full, UNIVERSAL, 1);
+        _grant(bobKey, BOB, CAROL, TrustLevel.Full, UNIVERSAL, 1);
+
+        _migrate(WRAPPED, true); // gatekeeper, wrapped
+        _migrate(BOB, false); // intermediary, unwrapped
+
+        _assertVerdicts(_nodes3(WRAPPED, BOB, CAROL), _defaultParams(), true, "path through migrated names");
+    }
+
+    function test_Migrated_AddressValidationFollowsResolver() public {
+        _gatedChainToCarol();
+        TrustPath memory path = _path(_nodes3(ALICE, BOB, CAROL));
+
+        _migrate(CAROL, false);
+        assertTrue(
+            registry.validateParticipantAddress(coordinator, MEV_COORDINATION, carol, path), "legacy resolver retained"
+        );
+
+        ens.setResolver(CAROL, address(0));
+        assertFalse(registry.validateParticipantAddress(coordinator, MEV_COORDINATION, carol, path), "resolver cleared");
+        assertTrue(
+            registry.validateParticipantWithPath(coordinator, MEV_COORDINATION, CAROL, path),
+            "node-based validation does not depend on the resolver"
         );
     }
 
